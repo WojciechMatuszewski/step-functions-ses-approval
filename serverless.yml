@@ -1,0 +1,151 @@
+service: w-step-learning-6
+
+provider:
+    name: aws
+    runtime: go1.x
+    region: eu-central-1
+    stage: ${opt:stage, 'dev'}
+
+package:
+    excludeDevDependencies: false
+
+custom:
+    APIGW_URL: !Join ["", ["https://", !Ref ApiGatewayRestApi, ".execute-api.${self:provider.region}.amazonaws.com/${self:provider.stage}"]]
+    JUDGE_ENDPOINT_URL: !Join ["", ["${self:custom.APIGW_URL}", "/judge"]]
+    SES_EMAIL_SENDER: test@test.com
+
+plugins:
+    - serverless-step-functions
+    - serverless-go-plugin
+    - serverless-iam-roles-per-function
+    - serverless-pseudo-parameters
+
+functions:
+    initialize:
+        handler: ./functions/initialize
+        environment:
+            STATE_MACHINE: !Ref StateMachine
+        events:
+            - http:
+                  path: /initialize
+                  method: POST
+        iamRoleStatementsName: ${self:service}-initialize-iam
+        iamRoleStatements:
+            - Effect: Allow
+              Action:
+                  - states:StartExecution
+              Resource:
+                  - !Ref StateMachine
+    notify:
+        handler: ./functions/notify
+        environment:
+            JUDGE_ENDPOINT_URL: ${self:custom.JUDGE_ENDPOINT_URL}
+            SES_EMAIL_SENDER: ${self:custom.SES_EMAIL_SENDER}
+        iamRoleStatementsName: ${self:service}-notify-iam
+        iamRoleStatements:
+            - Effect: Allow
+              Action:
+                  - ses:SendEmail
+              Resource:
+                  - "*"
+            - Effect: Allow
+              Action:
+                  # Needed for iam authorizer
+                  - execute-api:Invoke
+              Resource:
+                  - !Join ["", ["arn:aws:execute-api:", "${self:provider.region}:", "*:", !Ref ApiGatewayRestApi, "/${self:provider.stage}/GET/judge"]]
+    judge:
+        handler: ./functions/judge
+        environment:
+            STATE_MACHINE: !Ref StateMachine
+        iamRoleStatementsName: ${self:service}-judge-iam
+        iamRoleStatements:
+            - Effect: Allow
+              Action:
+                  - states:SendTaskSuccess
+                  - states:SendTaskFailure
+              Resource:
+                  - !Ref StateMachine
+        events:
+            - http:
+                  path: /judge
+                  method: GET
+                  authorizer: aws_iam
+                  request:
+                      parameters:
+                          querystrings:
+                              taskToken: true
+                              decision: true
+                              candidateEmail: true
+    outcome_approved:
+        handler: ./functions/outcome_approved
+        environment:
+            SES_EMAIL_SENDER: ${self:custom.SES_EMAIL_SENDER}
+        iamRoleStatementsName: ${self:service}-outcome_approved-iam
+        iamRoleStatements:
+            - Effect: Allow
+              Action:
+                  - ses:SendEmail
+              Resource:
+                  - "*"
+    outcome_denied:
+        handler: ./functions/outcome_denied
+        environment:
+            SES_EMAIL_SENDER: ${self:custom.SES_EMAIL_SENDER}
+        iamRoleStatementsName: ${self:service}-outcome_denied-iam
+        iamRoleStatements:
+            -   Effect: Allow
+                Action:
+                    - ses:SendEmail
+                Resource:
+                    - "*"
+
+
+
+stepFunctions:
+    validate: true
+    stateMachines:
+        StateMachine:
+            id: StateMachine
+            name: ${self:service}-StateMachine
+            definition:
+                Comment: "approval process"
+                StartAt: NOTIFY
+                States:
+                    NOTIFY:
+                        Type: Task
+                        Resource: "arn:aws:states:::lambda:invoke.waitForTaskToken"
+                        Parameters:
+                            FunctionName: !GetAtt NotifyLambdaFunction.Arn
+                            Payload:
+                                "taskToken.$": $$.Task.Token
+                                "user.$": "$"
+                        Next: JUDGE_CHOICE
+                    JUDGE_CHOICE:
+                        Type: Choice
+                        Choices:
+                            - Variable: "$.decision"
+                              StringEquals: "approve"
+                              Next: APPROVED
+                            - Variable: "$.decision"
+                              StringEquals: "deny"
+                              Next: DENIED
+                        Default: DENIED
+                    DENIED:
+                        Type: Task
+                        Resource: "arn:aws:states:::lambda:invoke"
+                        Parameters:
+                            FunctionName: !GetAtt outcome_denied.Arn
+                            Payload:
+                                "email.$": "$.email"
+                        End: true
+                    APPROVED:
+                        Type: Task
+                        Resource: "arn:aws:states:::lambda:invoke"
+                        Parameters:
+                            FunctionName: !GetAtt outcome_approved.Arn
+                            Payload:
+                                "email.$": "$.email"
+                        End: true
+
+
